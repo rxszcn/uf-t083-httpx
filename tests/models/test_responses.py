@@ -7,6 +7,8 @@ import pytest
 
 import httpx
 
+BOM = "\ufeff"
+
 
 class StreamingBody:
     def __iter__(self):
@@ -858,6 +860,140 @@ def test_json_with_specified_charset(encoding):
         headers=headers,
     )
     assert response.json() == data
+
+
+@pytest.mark.parametrize(
+    "content_type",
+    [
+        "application/json; charset=iso-8859-1",
+        "application/json; charset=utf-16",
+        "application/json; charset=gbk",
+        "Application/JSON;Charset=ISO-8859-1",
+        "application/problem+json; charset=iso-8859-1",
+        "application/ld+json; charset=iso-8859-1",
+        "application/json, charset=iso-8859-1",
+    ],
+)
+def test_json_charset_parameter_is_ignored(content_type):
+    # JSON text is restricted to the UTF encodings, so a declared charset
+    # must not take part in deciding how the content is decoded.
+    data = {"greeting": "你好", "recipient": "世界"}
+    content = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    headers = {"Content-Type": content_type}
+    response = httpx.Response(
+        200,
+        content=content,
+        headers=headers,
+    )
+    assert response.encoding == "utf-8"
+    assert response.text == '{"greeting": "你好", "recipient": "世界"}'
+    assert response.json() == data
+
+
+@pytest.mark.parametrize(
+    "encoding",
+    [
+        "utf-8",
+        "utf-8-sig",
+        "utf-16",
+        "utf-16-be",
+        "utf-16-le",
+        "utf-32",
+        "utf-32-be",
+        "utf-32-le",
+    ],
+)
+def test_json_with_mismatched_declared_charset(encoding):
+    # The content's encoding is identified from the JSON itself, regardless of
+    # any mismatch in the charset declaration.
+    data = {"greeting": "你好", "recipient": "世界"}
+    content = json.dumps(data, ensure_ascii=False).encode(encoding)
+    headers = {"Content-Type": "application/json; charset=iso-8859-1"}
+    response = httpx.Response(
+        200,
+        content=content,
+        headers=headers,
+    )
+    assert response.text == '{"greeting": "你好", "recipient": "世界"}'
+    assert response.json() == data
+
+
+@pytest.mark.parametrize(
+    "encoding, bom",
+    [
+        ("utf-8", b"\xef\xbb\xbf"),
+        ("utf-16-le", b"\xff\xfe"),
+        ("utf-16-be", b"\xfe\xff"),
+        ("utf-32-le", b"\xff\xfe\x00\x00"),
+        ("utf-32-be", b"\x00\x00\xfe\xff"),
+    ],
+)
+def test_json_byte_order_mark_is_stripped_from_text(encoding, bom):
+    # A byte order mark identifies the encoding, it isn't part of the text.
+    data = {"greeting": "你好", "recipient": "世界"}
+    text = json.dumps(data, ensure_ascii=False)
+    content = bom + text.encode(encoding)
+    headers = {"Content-Type": "application/json; charset=iso-8859-1"}
+    response = httpx.Response(
+        200,
+        content=content,
+        headers=headers,
+    )
+    assert response.text == text
+    assert not response.text.startswith(BOM)
+    assert response.json() == data
+
+
+def test_json_byte_order_mark_is_stripped_from_streaming_text():
+    data = {"greeting": "你好"}
+    content = BOM + json.dumps(data, ensure_ascii=False)
+    encoded = content.encode("utf-8")
+    chunks = [encoded[i : i + 5] for i in range(0, len(encoded), 5)]
+    headers = {"Content-Type": "application/json; charset=iso-8859-1"}
+    response = httpx.Response(
+        200,
+        content=iter(chunks),
+        headers=headers,
+    )
+    text = "".join(response.iter_text())
+    assert text == '{"greeting": "你好"}'
+    assert not text.startswith(BOM)
+
+
+@pytest.mark.anyio
+async def test_json_byte_order_mark_is_stripped_from_async_streaming_text():
+    data = {"greeting": "你好"}
+    content = BOM + json.dumps(data, ensure_ascii=False)
+    utf16_content = content.encode("utf-16")
+
+    async def stream() -> typing.AsyncIterator[bytes]:
+        for i in range(0, len(utf16_content), 7):
+            yield utf16_content[i : i + 7]
+
+    headers = {"Content-Type": "application/json; charset=iso-8859-1"}
+    response = httpx.Response(
+        200,
+        content=stream(),
+        headers=headers,
+    )
+    text = "".join([part async for part in response.aiter_text()])
+    assert text == '{"greeting": "你好"}'
+    assert not text.startswith(BOM)
+
+
+def test_non_json_charset_parameter_is_still_respected():
+    content = "Latin 1: ÿ".encode("latin-1")
+    headers = {"Content-Type": "text/plain; charset=latin-1"}
+    response = httpx.Response(200, content=content, headers=headers)
+    assert response.encoding == "latin-1"
+    assert response.text == "Latin 1: ÿ"
+
+
+def test_non_json_content_without_charset_still_uses_default_encoding():
+    content = "Latin 1: ÿ".encode("latin-1")
+    response = httpx.Response(200, content=content, default_encoding="latin-1")
+    assert response.encoding == "latin-1"
+    assert response.text == "Latin 1: ÿ"
 
 
 @pytest.mark.parametrize(

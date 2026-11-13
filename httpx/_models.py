@@ -90,6 +90,93 @@ def _parse_content_type_charset(content_type: str) -> str | None:
     return msg.get_content_charset(failobj=None)
 
 
+def _is_json_media_type(content_type: str) -> bool:
+    """
+    Return `True` for JSON media types, such as "application/json"
+    or types using the structured "+json" suffix, eg. "application/problem+json".
+
+    The charset parameter is deliberately ignored here. JSON text is restricted
+    to the UTF encodings, with the exact encoding identified by a byte order
+    mark or by inspecting the content, so a declared charset must not take part
+    in deciding how JSON bytes are decoded. Any parameters or stray commas in
+    the media type are ignored, matching the tolerant handling of other
+    malformed header values elsewhere in the library.
+    """
+    media_type = content_type.split(";", 1)[0].split(",", 1)[0].strip().lower()
+    return media_type == "application/json" or media_type.endswith("+json")
+
+
+def _detect_json_encoding(content: bytes) -> str:
+    """
+    Identify the encoding using the JSON specification's detection rules,
+    which are based on a byte order mark or on the content's byte patterns.
+    """
+    return jsonlib.detect_encoding(content)
+
+
+JSON_ENCODING_SAMPLE_SIZE = 4
+
+
+def _prefetch_json_bytes(
+    byte_content: typing.Iterator[bytes],
+) -> tuple[str, typing.Iterator[bytes]]:
+    """
+    Inspect the initial bytes of a streaming JSON response, so that the
+    encoding can be identified using the JSON specification's rules, before
+    any text is emitted.
+    """
+    buffered: list[bytes] = []
+    num_bytes = 0
+    for chunk in byte_content:
+        buffered.append(chunk)
+        num_bytes += len(chunk)
+        if num_bytes >= JSON_ENCODING_SAMPLE_SIZE:
+            break
+
+    encoding = _detect_json_encoding(b"".join(buffered))
+
+    def iter_buffered() -> typing.Iterator[bytes]:
+        yield from buffered
+        yield from byte_content
+
+    return encoding, iter_buffered()
+
+
+async def _aprefetch_json_bytes(
+    byte_content: typing.AsyncIterator[bytes],
+) -> tuple[str, typing.AsyncIterator[bytes]]:
+    """
+    Inspect the initial bytes of a streaming JSON response, so that the
+    encoding can be identified using the JSON specification's rules, before
+    any text is emitted.
+    """
+    buffered: list[bytes] = []
+    num_bytes = 0
+    async for chunk in byte_content:
+        buffered.append(chunk)
+        num_bytes += len(chunk)
+        if num_bytes >= JSON_ENCODING_SAMPLE_SIZE:
+            break
+
+    encoding = _detect_json_encoding(b"".join(buffered))
+
+    async def aiter_buffered() -> typing.AsyncIterator[bytes]:
+        for buffered_chunk in buffered:
+            yield buffered_chunk
+        async for chunk in byte_content:
+            yield chunk
+
+    return encoding, aiter_buffered()
+
+
+def _strip_byte_order_mark(text: str) -> str:
+    """
+    Drop a leading byte order mark. It identifies the encoding rather than
+    forming part of the actual text, so it should not be included in output.
+    """
+    return text[1:] if text.startswith("\ufeff") else text
+
+
 def _parse_header_links(value: str) -> list[dict[str, str]]:
     """
     Returns a list of parsed link headers, for more info see:
@@ -646,8 +733,19 @@ class Response:
                 self._text = ""
             else:
                 decoder = TextDecoder(encoding=self.encoding or "utf-8")
-                self._text = "".join([decoder.decode(self.content), decoder.flush()])
+                text = "".join([decoder.decode(self.content), decoder.flush()])
+                if self._is_json_response:
+                    text = _strip_byte_order_mark(text)
+                self._text = text
         return self._text
+
+    @property
+    def _is_json_response(self) -> bool:
+        """
+        Return `True` if the response is declaring a JSON media type.
+        """
+        content_type = self.headers.get("Content-Type")
+        return content_type is not None and _is_json_media_type(content_type)
 
     @property
     def encoding(self) -> str | None:
@@ -656,12 +754,27 @@ class Response:
         The priority for determining this is given by...
 
         * `.encoding = <>` has been set explicitly.
+        * For JSON responses, the encoding determined by the JSON specification,
+          based on a byte order mark or on the content's byte patterns. Any
+          charset parameter declared on the Content-Type header is ignored.
         * The encoding as specified by the charset parameter in the Content-Type header.
         * The encoding as determined by `default_encoding`, which may either be
           a string like "utf-8" indicating the encoding to use, or may be a callable
           which enables charset autodetection.
         """
         if not hasattr(self, "_encoding"):
+            if self._is_json_response:
+                # JSON text is restricted to the UTF encodings, and the specific
+                # encoding is identified by a byte order mark or by inspecting
+                # the content. The charset parameter is not part of that decision.
+                if not hasattr(self, "_content"):
+                    # The encoding can only be determined once the content is
+                    # available. Don't cache a guess, as `.text` and the text
+                    # iterators may be used once the response has been read.
+                    return "utf-8"
+                self._encoding = _detect_json_encoding(self._content)
+                return self._encoding
+
             encoding = self.charset_encoding
             if encoding is None or not _is_known_encoding(encoding):
                 if isinstance(self.default_encoding, str):
@@ -910,11 +1023,26 @@ class Response:
         that handles both gzip, deflate, etc but also detects the content's
         string encoding.
         """
-        decoder = TextDecoder(encoding=self.encoding or "utf-8")
         chunker = TextChunker(chunk_size=chunk_size)
         with request_context(request=self._request):
-            for byte_content in self.iter_bytes():
-                text_content = decoder.decode(byte_content)
+            encoding = self.encoding or "utf-8"
+            byte_content: typing.Iterator[bytes] = self.iter_bytes()
+            strip_byte_order_mark = self._is_json_response
+            if (
+                strip_byte_order_mark
+                and not hasattr(self, "_content")
+                and not hasattr(self, "_encoding")
+            ):
+                # A streaming JSON response, so the JSON encoding detection
+                # needs to inspect the starting bytes before decoding any text.
+                encoding, byte_content = _prefetch_json_bytes(byte_content)
+            decoder = TextDecoder(encoding=encoding)
+
+            for content in byte_content:
+                text_content = decoder.decode(content)
+                if strip_byte_order_mark and text_content:
+                    text_content = _strip_byte_order_mark(text_content)
+                    strip_byte_order_mark = False
                 for chunk in chunker.decode(text_content):
                     yield chunk
             text_content = decoder.flush()
@@ -1012,11 +1140,26 @@ class Response:
         that handles both gzip, deflate, etc but also detects the content's
         string encoding.
         """
-        decoder = TextDecoder(encoding=self.encoding or "utf-8")
         chunker = TextChunker(chunk_size=chunk_size)
         with request_context(request=self._request):
-            async for byte_content in self.aiter_bytes():
-                text_content = decoder.decode(byte_content)
+            encoding = self.encoding or "utf-8"
+            byte_content: typing.AsyncIterator[bytes] = self.aiter_bytes()
+            strip_byte_order_mark = self._is_json_response
+            if (
+                strip_byte_order_mark
+                and not hasattr(self, "_content")
+                and not hasattr(self, "_encoding")
+            ):
+                # A streaming JSON response, so the JSON encoding detection
+                # needs to inspect the starting bytes before decoding any text.
+                encoding, byte_content = await _aprefetch_json_bytes(byte_content)
+            decoder = TextDecoder(encoding=encoding)
+
+            async for content in byte_content:
+                text_content = decoder.decode(content)
+                if strip_byte_order_mark and text_content:
+                    text_content = _strip_byte_order_mark(text_content)
+                    strip_byte_order_mark = False
                 for chunk in chunker.decode(text_content):
                     yield chunk
             text_content = decoder.flush()

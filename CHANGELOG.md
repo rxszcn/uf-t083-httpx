@@ -14,6 +14,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 * Expose `FunctionAuth` from the public API. (#3699)
 
+### Fixed
+
+* JSON responses now ignore any `charset` parameter in the `Content-Type` header, and instead use the JSON specification's encoding detection rules, based on a byte order mark or on the content's byte patterns.
+* Leading byte order marks are no longer included in `Response.text` or the text iterators, for JSON responses.
+
 ## 0.28.1 (6th December, 2024)
 
 * Fix SSL case where `verify=False` together with client side certificates.
